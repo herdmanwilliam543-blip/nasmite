@@ -1,0 +1,315 @@
+#!/bin/bash
+
+if command -v nasm &> /dev/null; then
+    echo "NASM is already installed...  MOVING ONTO THE PROGRAM"
+else
+    echo "NASM not found. Installing... EXITING THE PROGRAM"
+    
+    # Update package lists and install nasm
+    sudo apt update
+    sudo apt install -y nasm
+    
+    # Verify installation
+    if command -v nasm &> /dev/null; then
+        echo "NASM installed successfully."
+    else
+        echo "Error: Failed to install NASM."
+        exit 1
+    fi
+fi
+
+SRC=$1
+[ -z "$SRC" ] && { echo "Usage: $0 <filename.nasmite>"; exit 1; }
+
+# Add these above the "while" loop
+COUNTER=0
+STACK=()
+
+
+OUT=${SRC%.nasmite}
+ASM_FILE="${OUT}.asm"
+VAR_FILE="vars.tmp"
+LOGIC_FILE="logic.tmp"
+
+> "$VAR_FILE"
+> "$LOGIC_FILE"
+
+is_assembling=0
+mode="header"
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" == "COMMENCE" ]]; then
+        mode="vars"
+        continue
+    elif [[ "$line" == "EXIT" ]]; then
+        break
+    fi
+
+./nasmite_checker "$SRC"
+if [ $? -ne 0 ]; then
+    echo "Compilation aborted due to syntax errors."
+    exit 1
+fi
+
+    # Variable Extraction
+    if [[ "$mode" == "vars" ]]; then
+        if [[ "$line" == *"-variable-"* ]]; then
+            var_name="${line%%-variable-*}"
+            var_val="${line#*-variable-}"
+            
+            if [[ "$var_val" =~ ^[0-9]+$ ]]; then
+                echo "${var_name}: db $var_val" >> "$VAR_FILE"
+            else
+                echo "${var_name}: db '$var_val', 0" >> "$VAR_FILE"
+                echo "${var_name}_len equ $ - ${var_name}" >> "$VAR_FILE"
+            fi
+        elif [[ "$line" != *";"* ]]; then
+            mode="logic"
+        fi
+    fi
+
+if [[ "$line" == *"-mix_var-"* ]]; then
+    # Format: name-var-type-value (e.g., count-var-dd-10)
+    IFS='-' read -r name _ type value <<< "$line"
+    
+    if [[ "$type" == "dd" ]]; then
+        echo "${name}: dd ${value}" >> "$VAR_FILE"
+    elif [[ "$type" == "db" ]]; then
+        # Check if the value is a string (has characters) or a number
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+            echo "${name}: db ${value}" >> "$VAR_FILE"
+        else
+            echo "${name}: db '${value}', 0" >> "$VAR_FILE"
+            echo "${name}_len equ $ - ${name}" >> "$VAR_FILE"
+        fi
+    fi
+fi
+
+# Logic Parsing
+    if [[ "$mode" == "logic" ]]; then
+        if [[ "$line" == *"_ASSEMBLE_"* ]]; then
+            is_assembling=$((1 - is_assembling))
+            continue
+        fi
+
+        if [[ $is_assembling -eq 1 ]]; then
+            echo "$line" >> "$LOGIC_FILE"
+        elif [[ "$line" =~ ^[a-zA-Z0-9_]+:$ ]]; then
+            echo "$line" >> "$LOGIC_FILE"
+        elif [[ "$line" == Print\ * ]]; then
+            var_name="${line#Print }"
+            echo "
+		      mov eax, 4
+	              mov ebx, 1
+		      mov ecx, newline
+		      mov edx, 1
+		      int 0x80
+
+		      mov eax, 4
+		      mov ebx, 1
+                      mov ecx, $var_name
+	              mov edx, ${var_name}_len
+	              int 0x80
+
+		      mov eax, 4
+	              mov ebx, 1
+		      mov ecx, newline
+		      mov edx, 1
+		      int 0x80
+
+		      mov eax, 4
+	              mov ebx, 1
+		      mov ecx, newline
+		      mov edx, 1
+		      int 0x80"  >> "$LOGIC_FILE"
+        elif [[ "$line" == IfEqu\ * ]]; then
+        ((COUNTER++))
+        LABEL="label_$COUNTER"
+        STACK+=("$LABEL") # Push onto stack
+
+            parts=($line)
+            val="${parts[1]}"
+
+            echo "    mov eax, 3
+		      mov ebx, 0
+		      mov ecx, _buffer
+		      mov edx, $val
+		      int 0x80" >> "$LOGIC_FILE"
+            echo "    cmp byte [_buffer], '$val'" >> "$LOGIC_FILE"
+            echo "    jne $LABEL" >> "$LOGIC_FILE"
+        elif [[ "$line" == "---" ]]; then
+        # Check if STACK is not empty to avoid errors
+        if [ ${#STACK[@]} -ne 0 ]; then
+            LAST_LABEL="${STACK[-1]}" # Peek at top of stack
+            unset 'STACK[${#STACK[@]}-1]' # Pop from stack
+            echo "$LAST_LABEL:" >> "$LOGIC_FILE" # Emit the label
+	   fi
+	elif [[ "$line" == LoopByTo\ * ]]; then
+            parts=($line)
+            val="${parts[1]}"
+            dest="${parts[2]}"
+            
+            echo "    dec edi" >> "$LOGIC_FILE"
+            echo "    cmp edi, 0" >> "$LOGIC_FILE"
+            echo "    jne $dest" >> "$LOGIC_FILE"
+	elif [[ "${parts[0]}" == "Randomize" ]]; then
+            echo "    rdtsc" >> "$LOGIC_FILE"
+            echo "    mov ecx, 4" >> "$LOGIC_FILE"
+            echo "    xor edx, edx" >> "$LOGIC_FILE"
+            echo "    div ecx" >> "$LOGIC_FILE"
+            echo "    mov [${parts[1]}], dl" >> "$LOGIC_FILE"
+     elif [[ "$line" == IfGreater\ * ]]; then
+        ((COUNTER++))
+        LABEL="label_$COUNTER"
+        STACK+=("$LABEL") # Push onto stack
+        
+        parts=($line)
+        val="${parts[1]}"
+        
+        echo "    mov eax, 3" >> "$LOGIC_FILE"
+        echo "    mov ebx, 0" >> "$LOGIC_FILE"
+        echo "    mov ecx, _buffer" >> "$LOGIC_FILE"
+        echo "    mov edx, $val" >> "$LOGIC_FILE"
+        echo "    int 0x80" >> "$LOGIC_FILE"
+        echo "    cmp byte [_buffer], '$val'" >> "$LOGIC_FILE"
+        echo "    jng $LABEL" >> "$LOGIC_FILE"
+
+    elif [[ "$line" == "---" ]]; then
+        # Check if STACK is not empty to avoid errors
+        if [ ${#STACK[@]} -ne 0 ]; then
+            LAST_LABEL="${STACK[-1]}" # Peek at top of stack
+            unset 'STACK[${#STACK[@]}-1]' # Pop from stack
+            echo "$LAST_LABEL:" >> "$LOGIC_FILE" # Emit the label
+	   fi
+    elif [[ "$line" == IfLesser\ * ]]; then
+        ((COUNTER++))
+        LABEL="label_$COUNTER"
+        STACK+=("$LABEL") # Push onto stack
+        
+        parts=($line)
+        val="${parts[1]}"
+        
+        echo "    mov eax, 3" >> "$LOGIC_FILE"
+        echo "    mov ebx, 0" >> "$LOGIC_FILE"
+        echo "    mov ecx, _buffer" >> "$LOGIC_FILE"
+        echo "    mov edx, $val" >> "$LOGIC_FILE"
+        echo "    int 0x80" >> "$LOGIC_FILE"
+        echo "    cmp byte [_buffer], '$val'" >> "$LOGIC_FILE"
+        echo "    jnl $LABEL" >> "$LOGIC_FILE"
+
+    elif [[ "$line" == "---" ]]; then
+        # Check if STACK is not empty to avoid errors
+        if [ ${#STACK[@]} -ne 0 ]; then
+            LAST_LABEL="${STACK[-1]}" # Peek at top of stack
+            unset 'STACK[${#STACK[@]}-1]' # Pop from stack
+            echo "$LAST_LABEL:" >> "$LOGIC_FILE" # Emit the label
+	   fi
+    elif [[ "$line" == IfNotLesser\ * ]]; then
+        ((COUNTER++))
+        LABEL="label_$COUNTER"
+        STACK+=("$LABEL") # Push onto stack
+        
+        parts=($line)
+        val="${parts[1]}"
+        
+        echo "    mov eax, 3" >> "$LOGIC_FILE"
+        echo "    mov ebx, 0" >> "$LOGIC_FILE"
+        echo "    mov ecx, _buffer" >> "$LOGIC_FILE"
+        echo "    mov edx, $val" >> "$LOGIC_FILE"
+        echo "    int 0x80" >> "$LOGIC_FILE"
+        echo "    cmp byte [_buffer], '$val'" >> "$LOGIC_FILE"
+        echo "    jl $LABEL" >> "$LOGIC_FILE"
+
+    elif [[ "$line" == "---" ]]; then
+        # Check if STACK is not empty to avoid errors
+        if [ ${#STACK[@]} -ne 0 ]; then
+            LAST_LABEL="${STACK[-1]}" # Peek at top of stack
+            unset 'STACK[${#STACK[@]}-1]' # Pop from stack
+            echo "$LAST_LABEL:" >> "$LOGIC_FILE" # Emit the label
+	   fi
+    elif [[ "$line" == IfNotGreater\ * ]]; then
+        ((COUNTER++))
+        LABEL="label_$COUNTER"
+        STACK+=("$LABEL") # Push onto stack
+        
+        parts=($line)
+        val="${parts[1]}"
+        
+        echo "    mov eax, 3" >> "$LOGIC_FILE"
+        echo "    mov ebx, 0" >> "$LOGIC_FILE"
+        echo "    mov ecx, _buffer" >> "$LOGIC_FILE"
+        echo "    mov edx, $val" >> "$LOGIC_FILE"
+        echo "    int 0x80" >> "$LOGIC_FILE"
+        echo "    cmp byte [_buffer], '$val'" >> "$LOGIC_FILE"
+        echo "    jg $LABEL" >> "$LOGIC_FILE"
+
+    elif [[ "$line" == "---" ]]; then
+        # Check if STACK is not empty to avoid errors
+        if [ ${#STACK[@]} -ne 0 ]; then
+            LAST_LABEL="${STACK[-1]}" # Peek at top of stack
+            unset 'STACK[${#STACK[@]}-1]' # Pop from stack
+            echo "$LAST_LABEL:" >> "$LOGIC_FILE" # Emit the label
+	   fi
+	elif [[ "$line" == Stall\ * ]]; then
+
+            parts=($line)
+            val="${parts[1]}"
+
+            echo "    mov eax, 162" >> "$LOGIC_FILE"
+	    echo "    mov ebx, $val" >> "$LOGIC_FILE"
+	    echo "    mov ecx, 0  " >> "$LOGIC_FILE"
+	    echo "    int 0x80    " >> "$LOGIC_FILE"
+        elif [[ "$line" == TakeNote\ * ]]; then
+
+            parts=($line)
+            val="${parts[1]}"
+
+            echo "    mov eax, 5" >> "$LOGIC_FILE"
+	    echo "    mov ebx, file" >> "$LOGIC_FILE"
+	    echo "    mov ecx, 101o " >> "$LOGIC_FILE"
+	    echo "    mov edx, 700o  " >> "$LOGIC_FILE"
+	    echo "    int 0x80    " >> "$LOGIC_FILE"
+
+	    echo "    mov ebx, eax" >> "$LOGIC_FILE"
+            echo "    mov eax, 4"   >> "$LOGIC_FILE"
+	    echo "    mov ecx, $val" >> "$LOGIC_FILE"
+	    echo "    mov edx, 9  ">> "$LOGIC_FILE" 
+	    echo "    int 0x80    " >> "$LOGIC_FILE"
+        fi
+    fi
+done < "$SRC"
+
+{
+    cat << 'EOF'
+BITS 32
+org 0x08048000
+_ehdr:
+        db 0x7F, "ELF", 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        dw 2, 3
+        dd 1, _start, _phdr - $$, 0, 0
+        dw _ehdr_size, _phdr_size, 1, 0, 0, 0
+_ehdr_size equ $ - _ehdr
+_phdr: 
+        dd 1, 0, $$, $$, _file_size, _file_size, 7, 0x1000
+_phdr_size equ $ - _phdr
+EOF
+    echo "newline: db 0xA"
+    echo "file: dd "text_bin"
+    cat "$VAR_FILE"
+    echo "_start:"
+    cat "$LOGIC_FILE"
+    echo "    mov eax, 1
+	      xor ebx, ebx
+	      int 0x80"
+    echo "_file_size equ $ - $$"
+    echo "section .bss"
+    echo "_buffer:"
+    echo "resb 256"
+
+} > "$ASM_FILE"
+
+nasm -f bin "$ASM_FILE" -o "${OUT}"
+chmod +x "${OUT}"
+rm -f "$ASM_FILE" "$VAR_FILE" "$LOGIC_FILE"
